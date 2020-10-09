@@ -1,8 +1,10 @@
+// TODO change pkg name to chain.
 package starportserve
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"go/build"
@@ -24,12 +26,16 @@ import (
 	"github.com/pkg/errors"
 	"github.com/tendermint/starport/starport/pkg/cmdrunner"
 	"github.com/tendermint/starport/starport/pkg/cmdrunner/step"
+	"github.com/tendermint/starport/starport/pkg/cosmosver"
 	"github.com/tendermint/starport/starport/pkg/fswatcher"
 	"github.com/tendermint/starport/starport/pkg/xexec"
 	"github.com/tendermint/starport/starport/pkg/xos"
 	"github.com/tendermint/starport/starport/pkg/xurl"
 	starportconf "github.com/tendermint/starport/starport/services/serve/conf"
+	"github.com/tendermint/starport/starport/services/serve/rly"
+	starportsecretconf "github.com/tendermint/starport/starport/services/serve/secretconf"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -50,6 +56,7 @@ type version struct {
 	hash string
 }
 
+// TODO change name to Chain.
 type Serve struct {
 	app            App
 	plugin         Plugin
@@ -105,6 +112,83 @@ func (s *Serve) Build(ctx context.Context) error {
 	}
 	fmt.Fprintf(s.stdLog(logStarport).out, "🗃  Installed. Use with: %s\n", infoColor(strings.Join(binaries, ", ")))
 	return nil
+}
+
+type relayerInfo struct {
+	ChainID    string
+	Mnemonic   string
+	RPCAddress string
+}
+
+// RelayerInfo initializes or updates relayer setup for the chain itself and returns
+// a meta info to share with other chains so they can connect.
+// TODO only stargate
+func (s *Serve) RelayerInfo() (base64Info string, err error) {
+	sconf, err := starportsecretconf.Open(s.app.Path)
+	if err != nil {
+		return "", err
+	}
+	relayerAcc, found := sconf.SelfRelayerAccount()
+	if !found {
+		if err := sconf.SetSelfRelayerAccount(); err != nil {
+			return "", err
+		}
+		relayerAcc, _ = sconf.SelfRelayerAccount()
+		if err := starportsecretconf.Save(s.app.Path, sconf); err != nil {
+			return "", err
+		}
+	}
+	rpcAddress, err := s.rpcAddress()
+	if err != nil {
+		return "", err
+	}
+	info := relayerInfo{
+		ChainID:    s.app.n(),
+		Mnemonic:   relayerAcc.Mnemonic,
+		RPCAddress: rpcAddress,
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(data), nil
+}
+
+func (s *Serve) RelayerAdd(base64Info string) error {
+	data, err := base64.RawStdEncoding.DecodeString(base64Info)
+	if err != nil {
+		return err
+	}
+	var info relayerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return err
+	}
+	sconf, err := starportsecretconf.Open(s.app.Path)
+	if err != nil {
+		return err
+	}
+	sconf.UpsertRelayerAccount(starportsecretconf.RelayerAccount{
+		ID:         info.ChainID,
+		Mnemonic:   info.Mnemonic,
+		RPCAddress: info.RPCAddress,
+	})
+	if err := starportsecretconf.Save(s.app.Path, sconf); err != nil {
+		return err
+	}
+	fmt.Fprint(s.stdLog(logStarport).out, "\n💫  Chain added\n")
+	return nil
+}
+
+func (s *Serve) rpcAddress() (string, error) {
+	rpcAddress := os.Getenv("RPC_ADDRESS")
+	if rpcAddress == "" {
+		conf, err := s.config()
+		if err != nil {
+			return "", err
+		}
+		rpcAddress = conf.Servers.RPCAddr
+	}
+	return rpcAddress, nil
 }
 
 // Serve serves an app.
@@ -180,6 +264,9 @@ func (s *Serve) checkSystem() error {
 	if !xexec.IsCommandAvailable("go") {
 		return errors.New("Please, check that Go language is installed correctly in $PATH. See https://golang.org/doc/install")
 	}
+	if s.plugin.Version() == cosmosver.Stargate && !xexec.IsCommandAvailable("rly") {
+		return errors.New("Please, check that Relayer is installed.")
+	}
 	// check if Go's bin added to System's path.
 	gobinpath := path.Join(build.Default.GOPATH, "bin")
 	if err := xos.IsInPath(gobinpath); err != nil {
@@ -216,6 +303,10 @@ func (s *Serve) serve(ctx context.Context) error {
 	if err != nil {
 		return &CannotBuildAppError{err}
 	}
+	sconf, err := starportsecretconf.Open(s.app.Path)
+	if err != nil {
+		return err
+	}
 
 	buildSteps, _ := s.buildSteps(ctx, conf)
 	if err := cmdrunner.
@@ -227,6 +318,17 @@ func (s *Serve) serve(ctx context.Context) error {
 		New(s.cmdOptions()...).
 		Run(ctx, s.initSteps(ctx, conf)...); err != nil {
 		return err
+	}
+
+	if s.plugin.Version() == cosmosver.Stargate {
+		relayerSteps := s.relayerSteps(ctx, sconf)
+		if len(relayerSteps) > 0 {
+			if err := cmdrunner.
+				New(s.cmdOptions()...).
+				Run(ctx, relayerSteps...); err != nil {
+				return err
+			}
+		}
 	}
 
 	return cmdrunner.
@@ -302,56 +404,7 @@ func (s *Serve) initSteps(ctx context.Context, conf starportconf.Config) (
 
 	for _, account := range conf.Accounts {
 		account := account
-		var (
-			key      = &bytes.Buffer{}
-			mnemonic = &bytes.Buffer{}
-		)
-		steps.Add(step.New(step.NewOptions().
-			Add(
-				s.plugin.AddUserCommand(account.Name),
-				step.PostExec(func(exitErr error) error {
-					if exitErr != nil {
-						return errors.Wrapf(exitErr, "cannot create %s account", account.Name)
-					}
-					var user struct {
-						Mnemonic string `json:"mnemonic"`
-					}
-					if err := json.NewDecoder(mnemonic).Decode(&user); err != nil {
-						return errors.Wrap(err, "cannot decode mnemonic")
-					}
-					fmt.Fprintf(s.stdLog(logStarport).out, "🙂 Created an account. Password (mnemonic): %[1]v\n", user.Mnemonic)
-					return nil
-				}),
-			).
-			Add(s.stdSteps(logAppcli)...).
-			// Stargate pipes from stdout, Launchpad pipes from stderr.
-			Add(step.Stderr(mnemonic), step.Stdout(mnemonic))...,
-		))
-		steps.Add(step.New(step.NewOptions().
-			Add(
-				s.plugin.ShowAccountCommand(account.Name),
-				step.PostExec(func(err error) error {
-					if err != nil {
-						return err
-					}
-					coins := strings.Join(account.Coins, ",")
-					key := strings.TrimSpace(key.String())
-					return cmdrunner.
-						New().
-						Run(ctx, step.New(step.NewOptions().
-							Add(step.Exec(
-								s.app.d(),
-								"add-genesis-account",
-								key,
-								coins,
-							)).
-							Add(s.stdSteps(logAppd)...)...,
-						))
-				}),
-			).
-			Add(s.stdSteps(logAppcli)...).
-			Add(step.Stdout(key))...,
-		))
+		steps.Add(s.createAccountSteps(ctx, account.Name, account.Coins, false)...)
 	}
 
 	for _, execOption := range s.plugin.ConfigCommands() {
@@ -373,6 +426,184 @@ func (s *Serve) initSteps(ctx context.Context, conf starportconf.Config) (
 		Add(s.stdSteps(logAppd)...)...,
 	))
 	return
+}
+
+func (s *Serve) relayerSteps(ctx context.Context, sconf *starportsecretconf.Config) (steps step.Steps) {
+	selfAcc, found := sconf.SelfRelayerAccount()
+	if !found {
+		return nil
+	}
+
+	// prep relayer config
+	rlyConf := rly.Config{
+		Global: rly.GlobalConfig{
+			Timeout:       "10s",
+			LiteCacheSize: 20,
+		},
+		Paths: rly.Paths{},
+	}
+	rpcAddress, err := s.rpcAddress()
+	if err != nil {
+		// TODO no panic
+		panic(err)
+	}
+
+	rlyConf.Chains = append(rlyConf.Chains, rly.NewChain(selfAcc.Name, rpcAddress))
+	for _, acc := range sconf.Relayer.Accounts {
+		rlyConf.Chains = append(rlyConf.Chains, rly.NewChain(acc.ID, acc.RPCAddress))
+		rlyConf.Paths[fmt.Sprintf("%s-%s", selfAcc.Name, acc.ID)] = rly.NewPath(
+			rly.NewPathEnd(selfAcc.Name, acc.ID),
+			rly.NewPathEnd(acc.ID, selfAcc.Name),
+		)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// TODO no panic
+		panic(err)
+	}
+	relayerHome := filepath.Join(home, s.app.nd(), "relayer")
+	if err := os.MkdirAll(filepath.Join(relayerHome, "config"), os.ModePerm); err != nil {
+		// TODO no panic
+		panic(err)
+	}
+
+	configPath := filepath.Join(relayerHome, "config/config.yml")
+	file, err := os.OpenFile(configPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		// TODO no panic
+		panic(err)
+	}
+	defer file.Close()
+	if err := yaml.NewEncoder(file).Encode(rlyConf); err != nil {
+		// TODO no panic
+		panic(err)
+	}
+
+	var (
+		key = &bytes.Buffer{}
+	)
+	for _, acc := range sconf.Accounts {
+		acc := acc
+		steps.Add(step.New(
+			step.Exec(
+				s.app.d(),
+				"keys",
+				"add",
+				acc.Name,
+				"--recover",
+				"--keyring-backend", "test",
+			),
+			step.Write([]byte(acc.Mnemonic+"\n")),
+		))
+		steps.Add(step.New(step.NewOptions().
+			Add(
+				s.plugin.ShowAccountCommand(acc.Name),
+				step.PostExec(func(err error) error {
+					if err != nil {
+						return err
+					}
+					coins := strings.Join(acc.Coins, ",")
+					key := strings.TrimSpace(key.String())
+					return cmdrunner.
+						New().
+						Run(ctx, step.New(step.NewOptions().
+							Add(step.Exec(
+								s.app.d(),
+								"add-genesis-account",
+								key,
+								coins,
+							)).
+							Add(s.stdSteps(logAppd)...)...,
+						))
+				}),
+			).
+			Add(step.Stdout(key))...,
+		))
+		steps.Add(step.New(
+			step.Exec("rly", "--home", relayerHome, "keys", "restore", selfAcc.Name, "testkey", selfAcc.Mnemonic),
+			step.Stderr(os.Stderr),
+		))
+		for _, acc := range sconf.Relayer.Accounts {
+			steps.Add(step.New(
+				step.Exec("rly", "--home", relayerHome, "keys", "restore", acc.ID, "testkey", acc.Mnemonic),
+				step.Stderr(os.Stderr),
+			))
+		}
+		steps.Add(step.New(
+			step.Exec("rly", "--home", relayerHome, "lite", "init", selfAcc.Name, "-f"),
+			step.Stderr(os.Stderr),
+		))
+		for _, acc := range sconf.Relayer.Accounts {
+			steps.Add(step.New(
+				step.Exec("rly", "--home", relayerHome, "lite", "init", acc.ID, "-f"),
+				step.Stderr(os.Stderr),
+			))
+		}
+		for name := range rlyConf.Paths {
+			steps.Add(step.New(
+				step.Exec("rly", "--home", relayerHome, "tx", "link", name, "-d", "-o", "3s"),
+				step.Stderr(os.Stderr),
+			))
+		}
+	}
+	return steps
+}
+
+func (s *Serve) createAccountSteps(ctx context.Context, name string, coins []string, isSilent bool) []*step.Step {
+	var (
+		key      = &bytes.Buffer{}
+		mnemonic = &bytes.Buffer{}
+	)
+	return []*step.Step{
+		step.New(step.NewOptions().
+			Add(
+				s.plugin.AddUserCommand(name),
+				step.PostExec(func(exitErr error) error {
+					if exitErr != nil {
+						return errors.Wrapf(exitErr, "cannot create %s account", name)
+					}
+					var user struct {
+						Mnemonic string `json:"mnemonic"`
+					}
+					if err := json.NewDecoder(mnemonic).Decode(&user); err != nil {
+						return errors.Wrap(err, "cannot decode mnemonic")
+					}
+					if !isSilent {
+						fmt.Fprintf(s.stdLog(logStarport).out, "🙂 Created an account. Password (mnemonic): %[1]v\n", user.Mnemonic)
+					}
+					return nil
+				}),
+			).
+			Add(s.stdSteps(logAppcli)...).
+			// Stargate pipes from stdout, Launchpad pipes from stderr.
+			Add(step.Stderr(mnemonic), step.Stdout(mnemonic))...,
+		),
+		step.New(step.NewOptions().
+			Add(
+				s.plugin.ShowAccountCommand(name),
+				step.PostExec(func(err error) error {
+					if err != nil {
+						return err
+					}
+					coins := strings.Join(coins, ",")
+					key := strings.TrimSpace(key.String())
+					return cmdrunner.
+						New().
+						Run(ctx, step.New(step.NewOptions().
+							Add(step.Exec(
+								s.app.d(),
+								"add-genesis-account",
+								key,
+								coins,
+							)).
+							Add(s.stdSteps(logAppd)...)...,
+						))
+				}),
+			).
+			Add(s.stdSteps(logAppcli)...).
+			Add(step.Stdout(key))...,
+		),
+	}
 }
 
 func (s *Serve) buildSteps(ctx context.Context, conf starportconf.Config) (
